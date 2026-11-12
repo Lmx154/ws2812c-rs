@@ -90,7 +90,7 @@ Version 0.1.0, as tested on the Rev 1 board.
 
 - Host: `cargo test` passes. Clippy, rustdoc and rustfmt are clean for the driver crate, and every public item is documented.
 - Board: `alive` and `ws2812c_smoke` exited 0 when last run. Measured by it (2026-11-11): after a dropped PIO send the next frame is correct, with a pause of 316 to 674 us before it; the longest single poll of `send` over 128 sends is 20 to 25 us on both transports (median 2.4 us on PIO, 20 us on SPI); the very first send after start-up takes longer in one poll, 37 to 39 us on PIO and 65 to 68 us on SPI, which is reported and not held to the budget.
-- Status LED: nobody has confirmed the colours by eye yet. The waveform on the pin is measured against the datasheet limits, which cannot show colour or the order of the colour bytes. `ws2812c_colours` is the check for a person: run it and compare the LED with the lines it prints.
+- Status LED: the colours were confirmed by eye on 2026-11-11 by the board's owner with `ws2812c_colours` (red, green, blue, white, then dark, twice, matching the lines it prints). The waveform checks on the pin cannot show colour or the order of the colour bytes, so that run is the proof of both.
 
 Not done for this device:
 
