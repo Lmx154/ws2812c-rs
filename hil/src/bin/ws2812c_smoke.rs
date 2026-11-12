@@ -9,11 +9,18 @@
 //! program overhead that is added.
 //!
 //! Stages: W1 PIO waveform, W2 reset gap, W3 SPI waveform and gap on SPI1 (TX GPIO43, SCK GPIO26),
-//! W4 blocking front-end, W5 colours for the eye. PIO0 is left to the SD driver.
+//! W4 blocking front-end, W5 colours for the eye, then W6 a cancelled PIO `send` (the future is
+//! dropped at several points, the next frame must still be right and preceded by the reset gap),
+//! W7 and W8 CPU time per poll of `send` on the PIO and SPI transports. PIO0 is left to the SD
+//! driver.
 #![no_std]
 #![no_main]
 
-use core::future::Future;
+use core::future::{Future, poll_fn};
+use core::pin::pin;
+use core::task::Poll;
+
+use cortex_m::peripheral::DWT;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -30,7 +37,7 @@ use panic_probe as _;
 use ws2812c::limits::*;
 use ws2812c::pio::PioTransport;
 use ws2812c::spi::{SPI_MAX_HZ, SPI_MIN_HZ, SPI_NOMINAL_HZ, SpiTransport};
-use ws2812c::{Rgb, Ws2812c, blocking};
+use ws2812c::{Bus, Rgb, Ws2812c, blocking};
 
 bind_interrupts!(struct Irqs {
     PIO1_IRQ_0 => pio::InterruptHandler<PIO1>;
@@ -376,10 +383,165 @@ const MODES: [(&str, Phase, Polarity); 4] = [
 /// shifts bytes back to back. CPOL only sets the idle level of SCK, which nothing listens to.
 const SPI_MODE: usize = 1;
 
+/// Most CPU time the driver may spend inside one poll of `send`.
+const POLL_BUDGET_US: u32 = 50;
+/// `send` calls timed per transport.
+const TIMED_SENDS: u32 = 128;
+/// Room for the polls of all timed sends.
+const MAX_POLLS: usize = 1024;
+
+/// DWT cycle counts of every poll of the timed `send` futures.
+struct PollStats {
+    cycles: [u32; MAX_POLLS],
+    n: usize,
+    overflow: bool,
+    sends: u32,
+    errors: u32,
+    min_polls: u32,
+    max_polls: u32,
+    worst: u32,
+    worst_send: u32,
+    worst_poll: u32,
+}
+
+impl PollStats {
+    const fn new() -> Self {
+        Self {
+            cycles: [0; MAX_POLLS],
+            n: 0,
+            overflow: false,
+            sends: 0,
+            errors: 0,
+            min_polls: u32::MAX,
+            max_polls: 0,
+            worst: 0,
+            worst_send: 0,
+            worst_poll: 0,
+        }
+    }
+}
+
+/// Runs `bus.send(words)` to completion on the executor, adding the DWT cycles of each of its
+/// polls (and nothing else) to `stats`. Interrupts that fire inside a poll count against it.
+async fn timed_send<B: Bus>(bus: &mut B, words: &[u32], stats: &mut PollStats) {
+    let mut fut = pin!(bus.send(words));
+    let mut polls = 0u32;
+    let ok = poll_fn(|cx| {
+        let t0 = DWT::cycle_count();
+        let r = fut.as_mut().poll(cx);
+        let dt = DWT::cycle_count().wrapping_sub(t0);
+        polls += 1;
+        if dt > stats.worst {
+            stats.worst = dt;
+            stats.worst_send = stats.sends;
+            stats.worst_poll = polls;
+        }
+        if stats.n < MAX_POLLS {
+            stats.cycles[stats.n] = dt;
+            stats.n += 1;
+        } else {
+            stats.overflow = true;
+        }
+        r.map(|r| r.is_ok())
+    })
+    .await;
+    stats.sends += 1;
+    stats.errors += !ok as u32;
+    stats.min_polls = stats.min_polls.min(polls);
+    stats.max_polls = stats.max_polls.max(polls);
+}
+
+/// CPU time per poll of `send`. The budget is the steady-state cost, so one warm-up send comes
+/// first: its longest poll is reported and not gated. Then `TIMED_SENDS` frames of `TEST_COLOR`
+/// back to back; the verdict is on the longest poll of those.
+async fn time_sends<B: Bus>(rep: &mut Report, label: &str, bus: &mut B, clk: u32) {
+    let to_ns = |c: u32| (c as u64 * 1_000_000_000 / clk as u64) as u32;
+    let word = [TEST_COLOR.wire()];
+    let mut first = PollStats::new();
+    timed_send(bus, &word, &mut first).await;
+    defmt::info!(
+        "[STAT] {=str} first send after start: longest poll {=u32} ns ({=u32} cycles), not gated",
+        label,
+        to_ns(first.worst),
+        first.worst
+    );
+    let mut stats = PollStats::new();
+    for _ in 0..TIMED_SENDS {
+        timed_send(bus, &word, &mut stats).await;
+    }
+    let n = stats.n;
+    stats.cycles[..n].sort_unstable();
+    let longest = stats.cycles[n.saturating_sub(1)];
+    let median = stats.cycles[n / 2];
+    defmt::info!(
+        "[STAT] {=str}: {=u32} sends, {=u32} polls, {=u32}..{=u32} polls per send, longest poll {=u32} ns ({=u32} cycles) in send {=u32} poll {=u32}, median poll {=u32} ns ({=u32} cycles)",
+        label,
+        stats.sends,
+        n as u32,
+        stats.min_polls,
+        stats.max_polls,
+        to_ns(longest),
+        longest,
+        stats.worst_send,
+        stats.worst_poll,
+        to_ns(median),
+        median
+    );
+    check!(
+        rep,
+        n > 0
+            && !stats.overflow
+            && stats.errors == 0
+            && stats.sends >= 100
+            && longest > 0
+            && to_ns(longest) <= POLL_BUDGET_US * 1000,
+        "{=str} {=str}: longest poll of send {=u32} us (limit {=u32} us), {=u32} sends, {=u32} errors",
+        label,
+        to_ns(longest) / 1000,
+        POLL_BUDGET_US,
+        stats.sends,
+        stats.errors
+    );
+}
+
+/// Polls the future `polls` times with the task's own waker (`embassy_time::Timer` needs it),
+/// the next poll coming when the future wakes the task, waits `wait_us`, then drops it. True if it
+/// was still pending when dropped, that is, if it really was cancelled.
+async fn poll_wait_drop<F: Future>(fut: F, polls: u32, wait_us: u64) -> bool {
+    let mut fut = pin!(fut);
+    let mut n = 0;
+    let completed = poll_fn(|cx| {
+        n += 1;
+        if fut.as_mut().poll(cx).is_ready() {
+            Poll::Ready(true)
+        } else if n == polls {
+            Poll::Ready(false)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    if completed {
+        return false;
+    }
+    if wait_us > 0 {
+        Timer::after_micros(wait_us).await;
+    }
+    true
+}
+
+/// Counts of the long capture of W6 case D: the idle count, 9 words of 24 highs and 24 lows (the
+/// last low is the gap), then the second frame without its idle count.
+const DROPPED_WORDS: usize = 9;
+const CHAIN_COUNTS: usize = 1 + DROPPED_WORDS * 48 + FRAME_COUNTS - 1;
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let mut p = embassy_rp::init(Default::default());
     let mut rep = Report { failures: 0 };
+    let mut core = cortex_m::Peripherals::take().unwrap();
+    core.DCB.enable_trace();
+    core.DWT.enable_cycle_counter();
     defmt::info!(
         "[INFO] ws2812c_smoke: WS2812C-2020 D20 on GPIO43, clk_sys {=u32} Hz, clk_peri {=u32} Hz",
         clk_sys_freq(),
@@ -524,6 +686,120 @@ async fn main(_spawner: Spawner) {
         led.off().await.unwrap();
         // Keep the line driven low until the LED has latched the off frame; releasing the PIO
         // lets the pad float.
+        Timer::after_millis(1).await;
+    }
+
+    // W6, W7: the PIO transport, a cancelled send and the time per poll.
+    {
+        let Pio {
+            mut common, sm0, ..
+        } = Pio::new(p.PIO1.reborrow(), Irqs);
+        let mut bus = PioTransport::new(&mut common, sm0, p.PIN_43.reborrow()).unwrap();
+        let word = [TEST_COLOR.wire()];
+
+        // The PIO `send` has three await points: `Timer::at(free_at)` (the reset gap of the frame
+        // before), `wait_push` (once per word, pending only when the FIFO is full) and
+        // `Timer::at(end)` (the frame leaving the pin). A `Timer` always pends on its first
+        // poll, so the first poll of any `send` stops at the first one. Each case drops a `send`
+        // at one of them, then sends `TEST_COLOR`, and `check_gap` holds the frame after the drop
+        // to the limits and to the reset gap in front of it. In case A the captured frame before
+        // the gap is the complete send before the dropped one; in B, C and D it is what the
+        // dropped send queued.
+        let mut pending = [false; 4];
+
+        // A: dropped in the wait for the gap after the frame before it; nothing was queued.
+        let g = two_frames(&mut cap, async {
+            Timer::after_millis(1).await;
+            bus.send(&word).await.unwrap();
+            pending[0] = poll_wait_drop(bus.send(&word), 1, 0).await;
+            bus.send(&word).await.unwrap();
+        })
+        .await;
+        check!(
+            rep,
+            pending[0],
+            "{=str} W6 A: send pending in its gap wait when dropped"
+        );
+        check_gap(&mut rep, "W6 A PIO dropped in the gap wait", &g);
+
+        // B: dropped right after the word was queued, in the wait for the end of the frame.
+        let g = two_frames(&mut cap, async {
+            Timer::after_millis(1).await;
+            pending[1] = poll_wait_drop(bus.send(&word), 2, 0).await;
+            bus.send(&word).await.unwrap();
+        })
+        .await;
+        check!(
+            rep,
+            pending[1],
+            "{=str} W6 B: send pending in its end wait when dropped"
+        );
+        check_gap(&mut rep, "W6 B PIO dropped after the push", &g);
+
+        // C: the same, dropped 15 us later, while the frame is half out.
+        let g = two_frames(&mut cap, async {
+            Timer::after_millis(1).await;
+            pending[2] = poll_wait_drop(bus.send(&word), 2, 15).await;
+            bus.send(&word).await.unwrap();
+        })
+        .await;
+        check!(
+            rep,
+            pending[2],
+            "{=str} W6 C: send pending in its end wait when dropped"
+        );
+        check_gap(&mut rep, "W6 C PIO dropped mid-frame", &g);
+
+        // D: eleven words; the FIFO (8) and the shift register (1) take nine, the tenth push
+        // waits for room, and the send is dropped there.
+        let mut buf = [0xDEAD_BEEF_u32; CHAIN_COUNTS];
+        let (done, _) = cap
+            .record(&mut buf, async {
+                Timer::after_millis(1).await;
+                pending[3] =
+                    poll_wait_drop(bus.send(&[TEST_COLOR.wire(); DROPPED_WORDS + 2]), 2, 0).await;
+                bus.send(&word).await.unwrap();
+            })
+            .await;
+        check!(
+            rep,
+            pending[3],
+            "{=str} W6 D: send pending in its push wait when dropped"
+        );
+        let g = if done {
+            let word = TEST_COLOR.wire();
+            let last = 1 + (DROPPED_WORDS - 1) * 48;
+            let a = analyse(&buf[last..last + 47], word, cap.clk);
+            let gap = ns_low(buf[last + 47], cap.clk);
+            let b = analyse(&buf[last + 48..], word, cap.clk);
+            Some((a, b, gap))
+        } else {
+            None
+        };
+        check_gap(&mut rep, "W6 D PIO dropped in the push wait", &g);
+
+        bus.send(&[0]).await.unwrap();
+
+        let clk = clk_sys_freq();
+        time_sends(&mut rep, "W7 PIO", &mut bus, clk).await;
+        bus.send(&[0]).await.unwrap();
+        Timer::after_millis(1).await;
+    }
+
+    // W8: the SPI transport on SPI1 (the mode W3 uses), the time per poll.
+    {
+        let (_, phase, polarity) = MODES[SPI_MODE];
+        let bus = Spi::new_txonly(
+            p.SPI1.reborrow(),
+            p.PIN_26.reborrow(),
+            p.PIN_43.reborrow(),
+            p.DMA_CH1.reborrow(),
+            Irqs,
+            spi_config(phase, polarity),
+        );
+        let mut bus = SpiTransport::new(bus);
+        time_sends(&mut rep, "W8 SPI", &mut bus, clk_sys_freq()).await;
+        bus.send(&[0]).await.unwrap();
         Timer::after_millis(1).await;
     }
 
