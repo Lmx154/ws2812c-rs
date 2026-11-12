@@ -70,13 +70,15 @@ On the board, through a debug probe (the script takes a lock, so runs never over
 
     tools/run.sh alive
     tools/run.sh ws2812c_smoke
+    tools/run.sh ws2812c_colours 600    # for a person watching the LED, about 36 s
 
 Used here: Rust 1.99.1 with the `thumbv8m.main-none-eabihf` target, probe-rs 0.31.0, and a debug probe on the SWD header J10.
 
 | Binary | What it checks |
 |---|---|
 | `alive` | tool chain, probe and board |
-| `ws2812c_smoke` | the waveform on the LED pin for both transports against the datasheet limits, the pause between frames, the blocking front-end; then red, green, blue, white for a person to watch |
+| `ws2812c_smoke` | the waveform on the LED pin for both transports against the datasheet limits, the pause between frames, the blocking front-end; red, green, blue, white for a person to watch; then a PIO send dropped at each of its await points (the next frame must be right and come after a pause above 280 us), and the CPU time of every poll of `send` on both transports against a 50 us budget |
+| `ws2812c_colours` | nothing by itself: it shows red, green, blue and white for 4 s each, then dark for 2 s, twice, and prints the colour and the bytes sent before each, so a person can compare the LED with the log |
 
 The exit status is 0 when every check passed. Full logs are kept under `hil/logs/`.
 
@@ -87,8 +89,8 @@ Pins the test uses: data on GPIO43. The pad input reads the driven waveform from
 Version 0.1.0, as tested on the Rev 1 board.
 
 - Host: `cargo test` passes. Clippy, rustdoc and rustfmt are clean for the driver crate, and every public item is documented.
-- Board: `alive` and `ws2812c_smoke` exited 0 when last run.
-- Status LED: nobody has confirmed the colours by eye yet. The waveform on the pin is measured against the datasheet limits; `ws2812c_smoke` ends with red, green, blue, white, then off, for that check.
+- Board: `alive` and `ws2812c_smoke` exited 0 when last run. Measured by it (2026-11-11): after a dropped PIO send the next frame is correct, with a pause of 316 to 674 us before it; the longest single poll of `send` over 128 sends is 20 to 25 us on both transports (median 2.4 us on PIO, 20 us on SPI); the very first send after start-up takes longer in one poll, 37 to 39 us on PIO and 65 to 68 us on SPI, which is reported and not held to the budget.
+- Status LED: nobody has confirmed the colours by eye yet. The waveform on the pin is measured against the datasheet limits, which cannot show colour or the order of the colour bytes. `ws2812c_colours` is the check for a person: run it and compare the LED with the lines it prints.
 
 Not done for this device:
 
@@ -101,7 +103,7 @@ Cargo.toml       the driver crate (its own workspace root)
 src/             the driver
 hil/             the on-board test: one package, its own workspace; the only place that uses embassy-rp
   src/lib.rs     reports the verdict to the host
-  src/bin/       alive.rs and ws2812c_smoke.rs
+  src/bin/       alive.rs, ws2812c_smoke.rs and ws2812c_colours.rs
   build.rs       links memory.x
 tools/run.sh     builds, flashes and runs one on-board test
 docs/device.md   timing and measured facts, pins, datasheet
