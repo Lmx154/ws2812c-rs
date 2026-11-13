@@ -5,6 +5,11 @@ edition = "2024"
 publish = false
 license = "MIT"
 description = "Driver for the Worldsemi WS2812C-2020 RGB LED: a pure colour and timing core, an SPI transport on embedded-hal, and a PIO transport for embassy-rp"
+repository = "https://github.com/Lmx154/ws2812c-rs"
+readme = "README.md"
+keywords = ["embedded", "no-std", "driver", "ws2812", "led"]
+categories = ["embedded", "no-std", "hardware-support"]
+rust-version = "1.99"
 
 [features]
 default = []

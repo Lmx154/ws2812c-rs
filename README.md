@@ -2,6 +2,10 @@
 
 Driver for the Worldsemi WS2812C-2020 RGB LED (one wire, 24 bits per LED, GRB order), the status LED D20 of the MARV V2 Rev 1 flight controller (RP2354B). It is built on the `embedded-hal` 1.0 traits only: it works with any executor or none. The crate root is the async driver. The `blocking` module is the same driver for blocking buses. The driver does colour handling only; the line goes through a `Bus`, with two transports in the crate. All LED knowledge (colours, the wire word, the datasheet timing limits, the SPI encoding and clock window, the PIO timing calculation) is pure code tested on the host. Patterns, blinking and fading are left to the application.
 
+## Works with
+
+The colour and timing core and the SPI transport work with any HAL and any MCU whose SPI implements `embedded-hal` 1.0 or `embedded-hal-async` 1.0. The PIO transport is for the Raspberry Pi RP2040/RP2350, is written for `embassy-rp` 0.10 and uses `embassy-time`; it is behind the `embassy-rp` feature. No back-end for `rp2040-hal` or `rp235x-hal` exists for the PIO transport; the core and the transport trait are the place to add one.
+
 ## Usage
 
 Async, PIO (feature `embassy-rp`):
